@@ -16,6 +16,9 @@
 #   -t, --test TEST_ID          Test ID to run (e.g., OADP-638)
 #   -F, --focus PATTERN         Ginkgo focus regex (e.g., "capacity filter")
 #   -p, --provider PROVIDER     Cloud provider (gcp, aws, azure) - auto-detected
+#   -b, --backup-location LOC   Override auto-detected backup location
+#                               Values: mcg, minio, rgw, cos, gcps3, azure_sak
+#                               Usually not needed - auto-detected from credentials file
 #   -c, --cleanup               Delete DPAs before running tests (minimal cleanup)
 #   -a, --all                   Run all tests (requires --test-folder)
 #   -d, --dry-run               List tests without running them
@@ -36,6 +39,7 @@
 #   ./run_test.sh --test OADP-638                          # Run single test (auto-detects folder)
 #   ./run_test.sh --test OADP-638 --cleanup                # Run test with DPA cleanup
 #   ./run_test.sh --test OADP-638 --provider aws           # Override provider detection
+#   ./run_test.sh --test OADP-750 --backup-location mcg   # AWS cluster with MCG/NooBaa storage
 #   ./run_test.sh --focus "capacity filter"                # Run tests matching focus pattern
 #   ./run_test.sh --focus "capacity filter" -f e2e         # Focus + explicit test folder
 #   ./run_test.sh --all --test-folder e2e/non-admin        # Run all non-admin tests
@@ -60,6 +64,7 @@ TEST_ID=""
 FOCUS_PATTERN=""
 TEST_FOLDER="e2e/non-admin"
 CLOUD_PROVIDER=""
+BACKUP_LOCATION_OVERRIDE=""
 DO_CLEANUP=false
 RUN_ALL=false
 DRY_RUN=false
@@ -104,6 +109,8 @@ Options:
   -F, --focus PATTERN         Ginkgo focus regex to match test descriptions
                               Use for running groups of tests by DescribeTable name
   -p, --provider PROVIDER     Cloud provider (gcp, aws, azure) - auto-detected from cluster
+  -b, --backup-location LOC   Override auto-detected backup location (mcg, minio, rgw, cos, gcps3)
+                              Usually not needed - auto-detected from credentials file profile
   -c, --cleanup               Delete DPAs before running tests (minimal cleanup)
   -a, --all                   Run all tests in the test folder (requires --test-folder)
   -d, --dry-run               List tests without running them
@@ -126,6 +133,7 @@ Examples:
   $0 --test OADP-638                          # Run single test (auto-detects folder)
   $0 --test OADP-638 --cleanup                # Run test with DPA cleanup
   $0 --test OADP-638 --provider aws           # Override provider detection
+  $0 --test OADP-750 --backup-location mcg   # AWS cluster with MCG/NooBaa storage
   $0 --focus "capacity filter"                # Run tests matching ginkgo focus pattern
   $0 --focus "capacity filter" -f e2e         # Focus + explicit test folder
   $0 --focus "Backup configuration"           # Run all resource policy tests
@@ -165,12 +173,16 @@ auto_detect_test_folder() {
         return 0
     fi
     
+    # For pipe-separated test IDs (e.g. "OADP-750|OADP-751"), use the first one
+    # for auto-detection since all must be in the same ginkgo suite
+    local detect_id="${test_id%%|*}"
+    
     # Search for test ID in different folders
     # Priority order: e2e/app_backup, e2e/non-admin, other e2e subdirs, then e2e root
     
     # Check if test exists in backup_lib/ (backup library tests - separate ginkgo suites)
     for subdir in backup_lib/backup backup_lib/restore; do
-        if [ -d "$subdir" ] && grep -r "\[tc-id:$test_id\]" "$subdir/" 2>/dev/null | grep -q "\.go:"; then
+        if [ -d "$subdir" ] && grep -r "\[tc-id:$detect_id\]" "$subdir/" 2>/dev/null | grep -q "\.go:"; then
             TEST_FOLDER="$subdir"
             print_info "Auto-detected test folder: $subdir (backup library test)"
             return 0
@@ -178,28 +190,28 @@ auto_detect_test_folder() {
     done
 
     # Check if test exists in e2e/app_backup/ (admin tests)
-    if grep -r "\[tc-id:$test_id\]" e2e/app_backup/ 2>/dev/null | grep -q "\.go:"; then
+    if grep -r "\[tc-id:$detect_id\]" e2e/app_backup/ 2>/dev/null | grep -q "\.go:"; then
         TEST_FOLDER="e2e"
         print_info "Auto-detected test folder: e2e (admin test in app_backup)"
         return 0
     fi
     
     # Check if test exists in e2e/non-admin/ (non-admin tests)
-    if grep -r "\[tc-id:$test_id\]" e2e/non-admin/ 2>/dev/null | grep -q "\.go:"; then
+    if grep -r "\[tc-id:$detect_id\]" e2e/non-admin/ 2>/dev/null | grep -q "\.go:"; then
         TEST_FOLDER="e2e/non-admin"
         print_info "Auto-detected test folder: e2e/non-admin"
         return 0
     fi
     
     # Check if test exists in e2e/oadp_cli/ (CLI tests - separate ginkgo suite)
-    if grep -r "\[tc-id:$test_id\]" e2e/oadp_cli/ 2>/dev/null | grep -q "\.go:"; then
+    if grep -r "\[tc-id:$detect_id\]" e2e/oadp_cli/ 2>/dev/null | grep -q "\.go:"; then
         TEST_FOLDER="e2e/oadp_cli"
         print_info "Auto-detected test folder: e2e/oadp_cli (CLI test)"
         return 0
     fi
 
     # Check if test exists in e2e/kubevirt-plugin/ (separate ginkgo suite)
-    if grep -r "\[tc-id:$test_id\]" e2e/kubevirt-plugin/ 2>/dev/null | grep -q "\.go:"; then
+    if grep -r "\[tc-id:$detect_id\]" e2e/kubevirt-plugin/ 2>/dev/null | grep -q "\.go:"; then
         TEST_FOLDER="e2e/kubevirt-plugin"
         print_info "Auto-detected test folder: e2e/kubevirt-plugin (KubeVirt test)"
         return 0
@@ -207,7 +219,7 @@ auto_detect_test_folder() {
 
     # Check other common e2e subdirectories
     for subdir in hooks schedule security dpa_deploy credentials incremental_restore must-gather operator resource_limits subscription cacert cloudstorage cross-cluster lrt; do
-        if [ -d "e2e/$subdir" ] && grep -r "\[tc-id:$test_id\]" "e2e/$subdir/" 2>/dev/null | grep -q "\.go:"; then
+        if [ -d "e2e/$subdir" ] && grep -r "\[tc-id:$detect_id\]" "e2e/$subdir/" 2>/dev/null | grep -q "\.go:"; then
             TEST_FOLDER="e2e"
             print_info "Auto-detected test folder: e2e (test found in $subdir)"
             return 0
@@ -215,7 +227,7 @@ auto_detect_test_folder() {
     done
     
     # Check e2e root directory (tests directly in e2e/)
-    if grep "\[tc-id:$test_id\]" e2e/*.go 2>/dev/null | grep -q ":"; then
+    if grep "\[tc-id:$detect_id\]" e2e/*.go 2>/dev/null | grep -q ":"; then
         TEST_FOLDER="e2e"
         print_info "Auto-detected test folder: e2e (test in root)"
         return 0
@@ -233,17 +245,13 @@ auto_detect_test_folder() {
 auto_detect_focus_folder() {
     local pattern="$1"
     
-    if [[ "$TEST_FOLDER" != "e2e/non-admin" ]]; then
-        return 0
-    fi
-    
     if [[ -z "$pattern" ]]; then
         return 0
     fi
     
     # Check backup_lib tests (separate ginkgo suites)
     for subdir in backup_lib/backup backup_lib/restore; do
-        if [ -d "$subdir" ] && grep -r "$pattern" "$subdir/" 2>/dev/null | grep -q "\.go:"; then
+        if [ -d "$subdir" ] && grep -rE "$pattern" "$subdir/" 2>/dev/null | grep -q "\.go:"; then
             TEST_FOLDER="$subdir"
             print_info "Auto-detected test folder: $subdir (backup library test matching focus pattern)"
             return 0
@@ -251,21 +259,21 @@ auto_detect_focus_folder() {
     done
 
     # Check OADP CLI tests
-    if grep -r "$pattern" e2e/oadp_cli/ 2>/dev/null | grep -q "\.go:"; then
+    if grep -rE "$pattern" e2e/oadp_cli/ 2>/dev/null | grep -q "\.go:"; then
         TEST_FOLDER="e2e/oadp_cli"
         print_info "Auto-detected test folder: e2e/oadp_cli (CLI test matching focus pattern)"
         return 0
     fi
 
     # Search for focus pattern in e2e/ (admin tests)
-    if grep -r "$pattern" e2e/app_backup/ e2e/hooks/ e2e/schedule/ e2e/dpa_deploy/ e2e/credentials/ e2e/incremental_restore/ 2>/dev/null | grep -q "\.go:"; then
+    if grep -rE "$pattern" e2e/app_backup/ e2e/hooks/ e2e/schedule/ e2e/dpa_deploy/ e2e/credentials/ e2e/incremental_restore/ 2>/dev/null | grep -q "\.go:"; then
         TEST_FOLDER="e2e"
         print_info "Auto-detected test folder: e2e (admin test matching focus pattern)"
         return 0
     fi
     
     # Check non-admin
-    if grep -r "$pattern" e2e/non-admin/ 2>/dev/null | grep -q "\.go:"; then
+    if grep -rE "$pattern" e2e/non-admin/ 2>/dev/null | grep -q "\.go:"; then
         TEST_FOLDER="e2e/non-admin"
         print_info "Auto-detected test folder: e2e/non-admin"
         return 0
@@ -283,6 +291,7 @@ auto_detect_focus_folder() {
 
 parse_args() {
     local original_test_folder="$TEST_FOLDER"
+    local test_folder_explicitly_set=false
     
     while [[ $# -gt 0 ]]; do
         case $1 in
@@ -296,6 +305,7 @@ parse_args() {
                 ;;
             -f|--test-folder)
                 TEST_FOLDER="$2"
+                test_folder_explicitly_set=true
                 # Validate test folder
                 if [[ "$TEST_FOLDER" != "e2e" ]] && [[ "$TEST_FOLDER" != "e2e/non-admin" ]] && [[ "$TEST_FOLDER" != "e2e/oadp_cli" ]] && [[ "$TEST_FOLDER" != "e2e/kubevirt-plugin" ]] && [[ "$TEST_FOLDER" != backup_lib/* ]]; then
                     print_error "Invalid test folder: $TEST_FOLDER"
@@ -307,6 +317,10 @@ parse_args() {
                 ;;
             -p|--provider)
                 CLOUD_PROVIDER="$2"
+                shift 2
+                ;;
+            -b|--backup-location)
+                BACKUP_LOCATION_OVERRIDE="$2"
                 shift 2
                 ;;
             -c|--cleanup)
@@ -353,12 +367,12 @@ parse_args() {
     fi
     
     # Auto-detect test folder if not explicitly set
-    if [[ -n "$TEST_ID" ]] && [[ "$TEST_FOLDER" == "$original_test_folder" ]]; then
+    if [[ "$test_folder_explicitly_set" == false ]] && [[ -n "$TEST_ID" ]]; then
         auto_detect_test_folder "$TEST_ID"
     fi
     
     # Auto-detect test folder for --focus if not explicitly set
-    if [[ -n "$FOCUS_PATTERN" ]] && [[ "$TEST_FOLDER" == "$original_test_folder" ]]; then
+    if [[ "$test_folder_explicitly_set" == false ]] && [[ -n "$FOCUS_PATTERN" ]]; then
         auto_detect_focus_folder "$FOCUS_PATTERN"
     fi
     
@@ -418,15 +432,37 @@ check_prerequisites() {
 
 check_existing_setup() {
     # Check if setup is already complete
-    # Use the cached kubeconfig (not ambient) to verify cluster connectivity
-    if [ -f "$TEST_SETTINGS_DIR/.setup_complete" ] && \
-       [ -f "$TEST_SETTINGS_DIR/kubeconfig" ] && \
-       [ -f "$TEST_SETTINGS_DIR/credentials" ] && \
-       KUBECONFIG="$TEST_SETTINGS_DIR/kubeconfig" oc whoami &> /dev/null; then
-        return 0  # Setup is complete
-    else
+    if [ ! -f "$TEST_SETTINGS_DIR/.setup_complete" ] || \
+       [ ! -f "$TEST_SETTINGS_DIR/kubeconfig" ] || \
+       [ ! -f "$TEST_SETTINGS_DIR/credentials" ]; then
         return 1  # Setup needed
     fi
+
+    # Invalidate cache if artifacts changed since last setup
+    if [ -f "$ARTIFACTS_DIR/credentials" ] && [ -f "$ARTIFACTS_DIR/kubeconfig" ] && [ -f "$ARTIFACTS_DIR/bucket.json" ]; then
+        local current_hash
+        current_hash="$(md5 -q "$ARTIFACTS_DIR/credentials" 2>/dev/null || md5sum "$ARTIFACTS_DIR/credentials" 2>/dev/null | awk '{print $1}')"
+        current_hash+="_$(md5 -q "$ARTIFACTS_DIR/kubeconfig" 2>/dev/null || md5sum "$ARTIFACTS_DIR/kubeconfig" 2>/dev/null | awk '{print $1}')"
+        current_hash+="_$(md5 -q "$ARTIFACTS_DIR/bucket.json" 2>/dev/null || md5sum "$ARTIFACTS_DIR/bucket.json" 2>/dev/null | awk '{print $1}')"
+
+        local cached_hash=""
+        if grep -q "^ARTIFACTS_HASH=" "$TEST_SETTINGS_DIR/.setup_complete" 2>/dev/null; then
+            cached_hash=$(grep "^ARTIFACTS_HASH=" "$TEST_SETTINGS_DIR/.setup_complete" | cut -d= -f2-)
+        fi
+
+        if [ "$current_hash" != "$cached_hash" ]; then
+            print_warning "Detected changed artifacts in $ARTIFACTS_DIR — invalidating cached setup"
+            rm -f "$TEST_SETTINGS_DIR/.setup_complete"
+            return 1  # Re-run setup
+        fi
+    fi
+
+    # Verify cluster connectivity with the cached kubeconfig
+    if ! KUBECONFIG="$TEST_SETTINGS_DIR/kubeconfig" oc whoami &> /dev/null; then
+        return 1  # Setup needed
+    fi
+
+    return 0  # Setup is complete
 }
 
 ################################################################################
@@ -596,10 +632,102 @@ detect_cloud_provider() {
     cp "$TEST_SETTINGS_DIR/credentials" "$TEST_SETTINGS_DIR/${CREDS_SUFFIX}_creds"
     print_success "Created provider-specific credentials file: ${CREDS_SUFFIX}_creds"
     
-    # Copy credentials for VSL (same credentials work for volume snapshots)
-    cp "$TEST_SETTINGS_DIR/credentials" "$TEST_SETTINGS_DIR/${CREDS_SUFFIX}_vsl_creds"
-    print_success "Created VSL credentials file: ${CREDS_SUFFIX}_vsl_creds"
+    # Copy VSL credentials: use separate vsl-credentials file if available,
+    # otherwise fall back to the same BSL credentials
+    if [ -f "$ARTIFACTS_DIR/vsl-credentials" ]; then
+        cp "$ARTIFACTS_DIR/vsl-credentials" "$TEST_SETTINGS_DIR/${CREDS_SUFFIX}_vsl_creds"
+        chmod 600 "$TEST_SETTINGS_DIR/${CREDS_SUFFIX}_vsl_creds"
+        print_success "Created VSL credentials file from vsl-credentials: ${CREDS_SUFFIX}_vsl_creds"
+    else
+        cp "$TEST_SETTINGS_DIR/credentials" "$TEST_SETTINGS_DIR/${CREDS_SUFFIX}_vsl_creds"
+        print_success "Created VSL credentials file (same as BSL): ${CREDS_SUFFIX}_vsl_creds"
+    fi
     
+    echo
+}
+
+################################################################################
+# Detect Backup Location
+# Auto-detects the actual backup target by inspecting the credentials file:
+#   - JSON format                  → gcp
+#   - Contains AZURE_*             → azure or azure_sak
+#   - INI [noobaa] profile         → mcg
+#   - INI [minio] profile          → minio
+#   - INI [rgw] profile            → rgw
+#   - INI [default] or unrecognized→ same as cloud provider
+# Can be overridden with --backup-location flag for edge cases (cos, gcps3).
+################################################################################
+
+detect_backup_location() {
+    print_banner "Detecting Backup Location"
+    
+    # If user explicitly set --backup-location, respect that
+    if [ -n "$BACKUP_LOCATION_OVERRIDE" ]; then
+        BACKUP_LOCATION_DETECTED="$BACKUP_LOCATION_OVERRIDE"
+        print_success "Using specified backup location: $BACKUP_LOCATION_DETECTED"
+        echo
+        return
+    fi
+    
+    local creds_file="$TEST_SETTINGS_DIR/credentials"
+    
+    if [ ! -f "$creds_file" ]; then
+        BACKUP_LOCATION_DETECTED="$CLOUD_PROVIDER"
+        print_warning "Credentials file not found, defaulting to cloud provider: $CLOUD_PROVIDER"
+        echo
+        return
+    fi
+    
+    # Detect credential format
+    local first_char
+    first_char=$(head -c 1 "$creds_file")
+    
+    if [[ "$first_char" == "{" ]]; then
+        BACKUP_LOCATION_DETECTED="gcp"
+        print_info "Detected GCP credentials (JSON format)"
+    elif grep -q "AZURE_SUBSCRIPTION_ID" "$creds_file" 2>/dev/null; then
+        if grep -q "AZURE_STORAGE_ACCOUNT_ACCESS_KEY" "$creds_file" 2>/dev/null; then
+            BACKUP_LOCATION_DETECTED="azure_sak"
+            print_info "Detected Azure Storage Account Key credentials"
+        else
+            BACKUP_LOCATION_DETECTED="azure"
+            print_info "Detected Azure SP credentials"
+        fi
+    else
+        # INI format - extract profile name
+        local profile
+        profile=$(grep '^\[' "$creds_file" | head -1 | tr -d '[]' | tr -d '[:space:]')
+        
+        case "$profile" in
+            noobaa)
+                BACKUP_LOCATION_DETECTED="mcg"
+                print_info "Detected MCG/NooBaa credentials (profile: $profile)"
+                ;;
+            minio)
+                BACKUP_LOCATION_DETECTED="minio"
+                print_info "Detected Minio credentials (profile: $profile)"
+                ;;
+            rgw)
+                BACKUP_LOCATION_DETECTED="rgw"
+                print_info "Detected Ceph RGW credentials (profile: $profile)"
+                ;;
+            default|"")
+                BACKUP_LOCATION_DETECTED="$CLOUD_PROVIDER"
+                print_info "Detected standard credentials (profile: ${profile:-default})"
+                ;;
+            *)
+                BACKUP_LOCATION_DETECTED="$CLOUD_PROVIDER"
+                print_warning "Unknown credential profile: $profile, defaulting to: $CLOUD_PROVIDER"
+                print_info "Use --backup-location to override if needed"
+                ;;
+        esac
+    fi
+    
+    if [ "$BACKUP_LOCATION_DETECTED" != "$CLOUD_PROVIDER" ]; then
+        print_success "Backup location: $BACKUP_LOCATION_DETECTED (cluster platform: $CLOUD_PROVIDER)"
+    else
+        print_success "Backup location: $BACKUP_LOCATION_DETECTED"
+    fi
     echo
 }
 
@@ -651,10 +779,17 @@ check_oadp_installation() {
 ################################################################################
 
 mark_setup_complete() {
+    local artifacts_hash
+    artifacts_hash="$(md5 -q "$ARTIFACTS_DIR/credentials" 2>/dev/null || md5sum "$ARTIFACTS_DIR/credentials" 2>/dev/null | awk '{print $1}')"
+    artifacts_hash+="_$(md5 -q "$ARTIFACTS_DIR/kubeconfig" 2>/dev/null || md5sum "$ARTIFACTS_DIR/kubeconfig" 2>/dev/null | awk '{print $1}')"
+    artifacts_hash+="_$(md5 -q "$ARTIFACTS_DIR/bucket.json" 2>/dev/null || md5sum "$ARTIFACTS_DIR/bucket.json" 2>/dev/null | awk '{print $1}')"
+
     echo "# Setup completed at: $(date)" > "$TEST_SETTINGS_DIR/.setup_complete"
     echo "CLOUD_PROVIDER=$CLOUD_PROVIDER" >> "$TEST_SETTINGS_DIR/.setup_complete"
     echo "BUCKET=$BUCKET_NAME" >> "$TEST_SETTINGS_DIR/.setup_complete"
     echo "CREDS_SUFFIX=$CREDS_SUFFIX" >> "$TEST_SETTINGS_DIR/.setup_complete"
+    echo "BACKUP_LOCATION_DETECTED=$BACKUP_LOCATION_DETECTED" >> "$TEST_SETTINGS_DIR/.setup_complete"
+    echo "ARTIFACTS_HASH=$artifacts_hash" >> "$TEST_SETTINGS_DIR/.setup_complete"
 }
 
 ################################################################################
@@ -666,6 +801,11 @@ load_existing_setup() {
         source "$TEST_SETTINGS_DIR/.setup_complete"
         export KUBECONFIG="$TEST_SETTINGS_DIR/kubeconfig"
         BUCKET_NAME="$BUCKET"
+        
+        # Allow --backup-location to override the cached value
+        if [ -n "$BACKUP_LOCATION_OVERRIDE" ]; then
+            BACKUP_LOCATION_DETECTED="$BACKUP_LOCATION_OVERRIDE"
+        fi
         
         # Ensure VSL credentials file exists (same creds work for volume snapshots)
         if [ -n "$CREDS_SUFFIX" ] && [ -f "$TEST_SETTINGS_DIR/${CREDS_SUFFIX}_creds" ] && \
@@ -687,6 +827,7 @@ display_test_config() {
     
     cat << EOF
 ${BLUE}Cloud Provider:${NC}     $CLOUD_PROVIDER
+${BLUE}Backup Location:${NC}    ${BACKUP_LOCATION_DETECTED:-$CLOUD_PROVIDER}
 ${BLUE}Bucket Name:${NC}        $BUCKET_NAME
 ${BLUE}Test Folder:${NC}        $TEST_FOLDER
 ${BLUE}Test ID:${NC}            ${TEST_ID:-"N/A"}
@@ -720,7 +861,11 @@ run_tests() {
     export BUCKET="$BUCKET_NAME"
     export TESTS_FOLDER="$TEST_FOLDER"
     export OADP_CREDS_FILE="$TEST_SETTINGS_DIR/${CREDS_SUFFIX}_creds"
-    export BACKUP_LOCATION="$CLOUD_PROVIDER"
+    if [ -n "$BACKUP_LOCATION_DETECTED" ]; then
+        export BACKUP_LOCATION="$BACKUP_LOCATION_DETECTED"
+    else
+        export BACKUP_LOCATION="$CLOUD_PROVIDER"
+    fi
     
     # Determine the ginkgo focus string
     # Note: test_runner.sh splits EXTRA_GINKGO_PARAMS by spaces (tr ' ' '\n'),
@@ -998,6 +1143,7 @@ EOF
             extract_bucket_name
             login_to_cluster
             detect_cloud_provider
+            detect_backup_location
             check_oadp_installation
             mark_setup_complete
         else
